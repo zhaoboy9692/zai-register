@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+accounts.json
+accounts.txt
+emails.txt
+.temp/
+venv/
+.venv/
