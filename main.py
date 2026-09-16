@@ -24,7 +24,6 @@ z.ai 注册机 — 命令行入口
 """
 
 import argparse
-import json
 import os
 import sys
 
@@ -32,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from zai import config
 from zai.register import register_one, register_batch
+from zai.results import ResultStore, PersistenceError
 
 
 def main():
@@ -75,6 +75,11 @@ def main():
     parser.add_argument("--no-email", action="store_true", help="跳过自动邮箱验证")
     parser.add_argument("--output", default=None, help="结果输出文件（默认: %s）" % config.OUTPUT_FILE)
     args = parser.parse_args()
+    if not (args.temp_mail or args.email or args.batch):
+        parser.print_help()
+        return
+    if args.temp_mail and args.count < 1:
+        parser.error('--count 必须是正整数')
 
     # 覆盖 config
     if args.proxy:
@@ -110,6 +115,7 @@ def main():
         }
 
     results = []
+    store = ResultStore(output_file)
 
     if args.temp_mail:
         # ── 临时邮箱模式 ──
@@ -123,6 +129,7 @@ def main():
             wait_email=not args.no_email,
             use_temp_mail=True,
             count=args.count,
+            on_progress=store.save,
         )
     elif args.batch:
         # ── 批量指定邮箱 ──
@@ -137,6 +144,7 @@ def main():
             imap_config=imap_config,
             wait_email=not args.no_email,
             use_temp_mail=False,
+            on_progress=store.save,
         )
     elif args.email:
         # ── 单个邮箱 ──
@@ -148,6 +156,7 @@ def main():
             imap_config=imap_config,
             wait_email=not args.no_email,
             use_temp_mail=False,
+            on_progress=store.save,
         )
         results = [result]
     else:
@@ -156,8 +165,6 @@ def main():
 
     # 保存结果
     if results:
-        with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
         print(f"\n{'='*60}")
         print(f"  结果已保存到 {output_file}")
         success = sum(1 for r in results if r.get("status") in ("complete", "verified"))
@@ -166,21 +173,21 @@ def main():
         for r in results:
             status = r.get("status", "?")
             email = r.get("email", "?")
-            token_short = r.get("token", "")[:20] + "..." if r.get("token") else "无"
-            print(f"  [{status:>13}] {email} / {r.get('password', '?')}  token: {token_short}")
+            print(f"  [{status:>13}] {email}（凭据见本地结果文件）")
 
         # ── 同时导出 txt 账号文件（邮箱|密码|状态|token）────
-        txt_file = os.path.splitext(output_file)[0] + ".txt"
-        lines = ["# z.ai 注册账号列表", "# 格式: 邮箱 | 密码 | 状态 | token", ""]
-        for r in results:
-            token = r.get("token", "") or ""
-            lines.append(f"{r.get('email', '')} | {r.get('password', '')} | {r.get('status', '?')} | {token}")
-        with open(txt_file, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+        txt_file = str(store.txt_path)
         print(f"  txt 账号已导出到 {txt_file}")
     else:
         print("没有注册结果")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n已停止。已完成账号及最近进度已实时写入结果文件。")
+        sys.exit(130)
+    except PersistenceError as exc:
+        print(f"\n[保存失败] {exc}", file=sys.stderr)
+        sys.exit(1)
