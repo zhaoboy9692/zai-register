@@ -152,7 +152,21 @@ zai-register/
     └── register.py       # 注册流程编排（含纯协议验证）
 ```
 
+## 浏览器与结果保存
+
+本节所述可靠性修复贡献：**馒头**（AK-47-WU）。
+
+可通过 `zai/config.py` 的 `BROWSER_CHANNEL` 选择浏览器：默认 `None` 使用 Playwright Chromium，`"chrome"` / `"msedge"` 使用本机已安装的 Chrome / Edge。
+
+Windows 安装脚本创建 `.venv`；启动脚本使用该环境并自动切换至项目目录。浏览器回归测试默认使用 Chromium，设置环境变量 `TEST_BROWSER_CHANNEL=chrome` 可改用本机 Chrome。
+
 ## 注意事项
+
+- 本地修复：每个账号开始、注册提交及结束时立即写入 JSON/TXT，后续账号异常或 Ctrl+C 不会丢失之前保存的结果。
+- 同一输出文件会保留以前运行的记录，新一轮记录追加；本轮进度按唯一标识更新。文件损坏或写入失败时停止，避免静默覆盖。
+- `pending` / `signup_done` / `interrupted` 均不代表账号已激活；恢复运行不会自动重试这些账号。
+- 验证窗口会主动置前，滑块仍需人工完成。验证码未显示时最多尝试重新触发 3 次；页面跳走、窗口关闭或等待超时会记录失败并继续后续账号。
+- 本地回归检查：`.venv\Scripts\python.exe -m unittest discover -s tests -v`（只使用模拟接口和本地浏览器页面）。
 
 - z.ai 按邮箱限流 60 秒，批量注册自动间隔 65 秒
 - 滑块验证码必须手动完成，脚本不自动过滑块

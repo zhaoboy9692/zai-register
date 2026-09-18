@@ -18,6 +18,7 @@ import json
 import time
 import random
 import string
+import uuid
 from urllib.parse import urlparse, parse_qs
 
 from . import config
@@ -25,6 +26,7 @@ from .api import ZaiAPI
 from .captcha import CaptchaSolver
 from .email_api import TempMailClient
 from .email_verify import fetch_verify_token
+from .results import PersistenceError
 
 
 def _random_name(length=10):
@@ -79,7 +81,39 @@ def _pure_protocol_verify(api, email_addr, password, name, verify_url):
     return fin_data if jwt else (fin_data or None)
 
 
-def register_one(
+def register_one(email_addr=None, password=None, name=None, imap_config=None,
+                 wait_email=True, mail_client=None, use_temp_mail=False,
+                 on_progress=None):
+    """注册一次；on_progress 接收快照，写入失败应抛出 PersistenceError。"""
+    state = {"attempt_id": uuid.uuid4().hex, "status": "pending"}
+
+    def checkpoint(result):
+        state.update(result)
+        if on_progress:
+            on_progress(dict(state))
+
+    try:
+        result = _register_one(
+            email_addr=email_addr, password=password, name=name,
+            imap_config=imap_config, wait_email=wait_email, mail_client=mail_client,
+            use_temp_mail=use_temp_mail, on_progress=checkpoint,
+        )
+    except PersistenceError:
+        raise
+    except KeyboardInterrupt:
+        state.update(status="interrupted", error="用户中断；账号实际状态需核实")
+        checkpoint(state)
+        raise
+    except Exception as exc:
+        state.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+        checkpoint(state)
+        print(f"  [失败] {type(exc).__name__}，已记录当前账号")
+        return state
+    checkpoint(result)
+    return state
+
+
+def _register_one(
     email_addr=None,
     password=None,
     name=None,
@@ -87,6 +121,7 @@ def register_one(
     wait_email=True,
     mail_client=None,
     use_temp_mail=False,
+    on_progress=None,
 ):
     """
     注册单个 z.ai 账号。
@@ -125,7 +160,7 @@ def register_one(
     password = password or email_addr
 
     print(f"\n{'='*60}")
-    print(f"  注册: {email_addr} / {password} / {name}")
+    print(f"  注册: {email_addr} / 密码已隐藏 / {name}")
     print(f"{'='*60}")
 
     api = ZaiAPI()
@@ -135,6 +170,8 @@ def register_one(
         "name": name,
         "status": "pending",
     }
+    if on_progress:
+        on_progress(result)
 
     # ── Step 1: 浏览器手动滑块 ───────────────────────
     print("\n[1/5] 打开浏览器，手动完成滑块验证码...")
@@ -168,6 +205,8 @@ def register_one(
 
     result["signup_response"] = signup_data
     result["status"] = "signup_done"
+    if on_progress:
+        on_progress(result)
 
     # ── Step 3: 邮箱验证 ─────────────────────────────
     if not wait_email:
@@ -290,6 +329,8 @@ def register_one(
         result["status"] = "email_pending"
 
     # ── Step 5: 登录测试（如果已有 token 则跳过）────────
+    if on_progress:
+        on_progress(result)
     if result.get("token"):
         print("\n[5/5] 已从完成注册获取到 JWT，跳过登录测试")
     else:
@@ -321,6 +362,7 @@ def register_batch(
     wait_email=True,
     use_temp_mail=False,
     count=None,
+    on_progress=None,
 ):
     """
     批量注册。
@@ -332,6 +374,7 @@ def register_batch(
         wait_email:    是否等待邮箱验证
         use_temp_mail: 是否使用临时邮箱 API 自动创建邮箱
         count:         使用临时邮箱时的注册数量
+        on_progress:   每个账号的进度回调；保存错误会停止批量流程
 
     返回:
         list[dict]: 每个账号的注册结果
@@ -359,6 +402,7 @@ def register_batch(
                 wait_email=wait_email,
                 mail_client=mail_client,
                 use_temp_mail=True,
+                on_progress=on_progress,
             )
         else:
             email_addr = emails[i]
@@ -372,6 +416,7 @@ def register_batch(
                 imap_config=imap_config,
                 wait_email=wait_email,
                 use_temp_mail=False,
+                on_progress=on_progress,
             )
 
         results.append(result)

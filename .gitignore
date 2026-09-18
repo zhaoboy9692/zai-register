@@ -2,6 +2,12 @@ __pycache__/
 *.pyc
 accounts.json
 accounts.txt
+accounts-*.json
+accounts-*.txt
+recovered-accounts-*.txt
+.env
+.env.*
+!.env.example
 emails.txt
 .temp/
 venv/

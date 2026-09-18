@@ -1,20 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-阿里云滑块验证码 — Playwright 手动完成模块 v3
-
-改进点（v3）：
-1. page.on("response") 作为唯一主通道：拦截浏览器发出的 signup 请求的完整 captcha_verify_param 和响应
-2. 不再从 console 提取 captcha_verify_param（console 输出会截断参数，len=278 vs 正确 len=280）
-3. XHR hook 保留作为 backup 参数来源
-4. 滑块验证通过后自动点提交，让浏览器自己发 signup 请求（不用截断的参数单独发 API）
-5. 自动重试提交按钮（10秒无响应则重新点击）
-6. 修复 _check_captcha_passed 中 JS 变量作用域 bug（text 在 if(el) 内声明，popup 块中引用导致永远 false）
+Playwright 人工滑块流程：响应监听、明确成功信号、有限触发重试。
+浏览器关闭、页面跳转、缺少提交按钮或等待超时都会终止当前尝试。
 """
 
 import json
 import sys
 import time
 import ctypes
+from contextlib import ExitStack
 
 from . import config
 
@@ -44,6 +38,13 @@ def _bring_window_to_front(title_keyword):
             return False
 
         user32 = ctypes.windll.user32
+        from ctypes import wintypes
+        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
         found = []
 
         enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
@@ -121,16 +122,18 @@ class CaptchaSolver:
         """
         from playwright.sync_api import sync_playwright
 
-        result = {"captcha": None, "response": None}
+        result = {"captcha": None, "response": None, "error": None}
         target_path = "/auths/signup" if mode == "signup" else "/auths/signin"
 
-        with sync_playwright() as p:
+        with sync_playwright() as p, ExitStack() as cleanup:
             launch_args = ["--disable-blink-features=AutomationControlled"]
             browser = p.chromium.launch(
                 headless=False,
+                channel=config.BROWSER_CHANNEL,
                 proxy={"server": self.proxy} if self.proxy else None,
                 args=launch_args,
             )
+            cleanup.callback(browser.close)
             ctx = browser.new_context(
                 user_agent=config.UA,
                 viewport={"width": 1280, "height": 800},
@@ -139,7 +142,7 @@ class CaptchaSolver:
 
             # ── 注入 JS hook（在页面加载前）──────────────────
             page.add_init_script(_INJECT_JS)
-            print("  [浏览器] 已注入 JS hook（fetch/XHR 拦截）")
+            print("  [浏览器] 已安装 XHR hook 和响应监听")
 
             # ── 监听 console 日志（调试用）────────────────────
             def on_console(msg):
@@ -160,7 +163,11 @@ class CaptchaSolver:
                                 result["captcha"] = cap
                                 print(f"  [拦截-PW] captcha_verify_param 已捕获 (len={len(cap)})")
                         try:
-                            result["response"] = resp.json()
+                            data = resp.json()
+                            if resp.status >= 400 or not isinstance(data, dict) or data.get('success') is False or data.get('detail') or data.get('error'):
+                                result['error'] = f'注册接口拒绝请求（HTTP {resp.status}），请查看页面提示'
+                            else:
+                                result["response"] = data
                         except Exception:
                             pass
                     except Exception as e:
@@ -171,25 +178,28 @@ class CaptchaSolver:
             action = "signup" if mode == "signup" else "signin"
             url = f"https://chat.z.ai/auth?action={action}"
             print(f"  [浏览器] 打开 {url} ...")
-            page.goto(url, wait_until="networkidle", timeout=60000)
-            time.sleep(2)
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2000)
+
+            page.bring_to_front()
 
             # ── 窗口置顶：确保用户能看到浏览器窗口 ──────────
             for kw in ["Chromium", "Google Chrome", "Z.ai", "chat.z.ai"]:
                 if _bring_window_to_front(kw):
                     break
-            time.sleep(0.5)
+            page.wait_for_timeout(500)
 
             # ── 自动填表 ──────────────────────────────────────
             self._fill_form(page, email, password, name, mode)
-            time.sleep(1)
+            page.wait_for_timeout(1000)
 
             # ── 点击提交按钮 ───────────────────────────────────
             self._click_submit(page)
 
             # ── 等待验证码区域出现，自动点击触发滑块 ──────────
-            time.sleep(2)
-            self._trigger_captcha(page)
+            page.wait_for_timeout(2000)
+            if result['response'] is None and not self._captcha_visible(page):
+                self._trigger_captcha(page)
 
             print()
             print("  ╔══════════════════════════════════════════════════╗")
@@ -198,143 +208,63 @@ class CaptchaSolver:
             print("  ╚══════════════════════════════════════════════════╝")
             print()
 
-            # ── 轮询等待：page.on("response") 主通道 ──────────
-            submit_clicked = False
-            submit_click_time = 0
-            start = time.time()
-
-            while True:
-                elapsed = time.time() - start
-                if elapsed > timeout:
-                    print(f"  [超时] {timeout} 秒内未捕获到验证码 token")
+            # Playwright 的等待会处理浏览器事件；time.sleep 会阻塞事件分发。
+            start = time.monotonic()
+            next_trigger = start + 10
+            next_submit = start
+            trigger_attempts = 0
+            missing_submit_since = None
+            while time.monotonic() - start < timeout:
+                if result['error']:
+                    raise RuntimeError(result['error'])
+                if result['response'] is not None:
                     break
-
-                # 检查 JS hook（XHR）是否捕获到 captcha（backup）
-                try:
-                    hook_captcha = page.evaluate("() => window.__captchaParam")
-                    if hook_captcha and not result["captcha"]:
-                        result["captcha"] = hook_captcha
-                        print(f"  [拦截-JS] captcha_verify_param 已捕获 (len={len(hook_captcha)})")
-                except Exception:
-                    pass
-
-                # 拿到 response → 完成
-                if result["response"]:
-                    break
-
-                # ── 检测"验证通过"文字 → 滑块已完成 → 自动点提交 ──
-                if not submit_clicked:
-                    passed = self._check_captcha_passed(page)
-                    if passed:
-                        print('  [验证码] 检测到验证通过！自动点提交按钮...')
-                        time.sleep(1)
-                        self._click_submit(page)
-                        submit_clicked = True
-                        submit_click_time = time.time()
-                        time.sleep(2)
+                if page.is_closed() or not browser.is_connected():
+                    raise RuntimeError('验证窗口已关闭，当前账号已停止')
+                if '/auth' not in page.url:
+                    raise RuntimeError('页面已离开登录/注册页，请重新运行当前账号')
+                now = time.monotonic()
+                if self._check_captcha_passed(page):
+                    if now >= next_submit:
+                        if self._click_submit(page):
+                            missing_submit_since = None
+                        elif missing_submit_since is None:
+                            missing_submit_since = now
+                        elif now - missing_submit_since >= 15:
+                            raise RuntimeError('验证后找不到提交按钮，停止当前账号，避免无限重试')
+                        next_submit = now + 10
+                elif now >= next_trigger and not self._captcha_visible(page):
+                    if trigger_attempts < 3:
+                        page.bring_to_front()
+                        self._trigger_captcha(page)
+                        trigger_attempts += 1
+                        print(f'  [验证码] 已重新检查触发入口（{trigger_attempts}/3），请手动拖动滑块')
+                        next_trigger = now + 15
                     else:
-                        # 每 15 秒打印一次当前页面状态，方便排查
-                        if int(elapsed) % 15 == 0 and int(elapsed) > 0:
-                            try:
-                                bt = page.evaluate("() => document.body ? document.body.innerText.slice(0, 300) : ''")
-                                print(f"  [状态] body 文本片段: {bt.replace(chr(10), ' | ')[:200]}")
-                            except Exception:
-                                pass
-                else:
-                    # ── 已点提交但还没拿到 response，10秒后重试 ──
-                    if not result["response"] and time.time() - submit_click_time > 10:
-                        print('  [重试] 10秒无响应，重新点击提交按钮...')
-                        self._click_submit(page)
-                        submit_click_time = time.time()
-                        time.sleep(2)
-
-                time.sleep(0.5)
-
-            # 额外等 2 秒确保响应完整
-            if result["captcha"] or result["response"]:
-                time.sleep(2)
-                # 最后再读一次 JS hook
-                try:
-                    if not result["captcha"]:
-                        h = page.evaluate("() => window.__captchaParam")
-                        if h:
-                            result["captcha"] = h
-                except Exception:
-                    pass
-
-            browser.close()
+                        raise RuntimeError('验证码弹窗仍未出现，可能未加载或被站点限制；请检查浏览器后重试')
+                page.wait_for_timeout(500)
+            else:
+                raise TimeoutError(f'{timeout} 秒内未完成验证或未收到注册响应')
 
         return result["captcha"], result["response"]
 
-    # ── 检测滑块是否已完成验证 ──────────────────────
     def _check_captcha_passed(self, page):
-        """检测阿里云滑块验证是否已通过。"""
-        try:
-            result = page.evaluate("""() => {
-                // 0. 最可靠的检测：整个页面 body 文本中是否出现"验证通过/验证成功"
-                //    （绿色提示条可能不在 #captcha-element 内，class 也不含 aliyun/captcha）
-                const bodyText = (document.body ? document.body.innerText : '') || '';
-                if (bodyText.includes('验证通过') || bodyText.includes('验证成功') ||
-                    bodyText.includes('Slide completed') || bodyText.includes('Verification successful')) {
-                    return true;
-                }
-                // 1. 检查 captcha-element 的"验证通过"文字（中英文）
-                const el = document.querySelector('#captcha-element');
-                if (el) {
-                    const text = (el.innerText || '').trim();
-                    if (text.includes('验证通过') || text.includes('验证成功') ||
-                        text.includes('Slide completed') || text.includes('Verification passed') ||
-                        text.includes('Verification successful')) {
-                        return true;
-                    }
-                }
-                // 2. 检查所有 captcha 相关元素
-                const all = document.querySelectorAll('[class*="aliyun"], [id*="aliyun"], [class*="captcha"], [id*="captcha"]');
-                for (const e of all) {
-                    const t = (e.innerText || '').trim();
-                    if (t.includes('验证通过') || t.includes('验证成功') ||
-                        t.includes('Slide completed')) {
-                        return true;
-                    }
-                }
-                // 3. 检查滑块 class 变化
-                const slider = document.querySelector('#aliyunCaptcha-sliding-slider');
-                if (slider) {
-                    const cls = slider.className || '';
-                    if (cls.includes('success') || cls.includes('done') || cls.includes('pass')) {
-                        return true;
-                    }
-                }
-                // 4. 检查 captcha popup 是否已关闭（验证通过后 popup 会消失）
-                const popup = document.querySelector('#aliyunCaptcha-window-float');
-                if (popup) {
-                    const cls = popup.className || '';
-                    const style = window.getComputedStyle(popup);
-                    if (cls.includes('hide') || cls.includes('hidden') || cls.includes('close') ||
-                        style.display === 'none' || style.visibility === 'hidden') {
-                        // popup 关了，再检查 captcha-element 文本
-                        const el2 = document.querySelector('#captcha-element');
-                        if (el2) {
-                            const t2 = (el2.innerText || '').trim();
-                            if (t2 && !t2.includes('点击开始验证') && !t2.includes('请拖动') &&
-                                !t2.includes('Click to start') && !t2.includes('Please complete')) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                // 5. 检查 captcha-element 是否为空或 captcha wrapper 消失
-                if (el) {
-                    const text = (el.innerText || '').trim();
-                    if (text === '' || !el.querySelector('#aliyunCaptcha-captcha-wrapper')) {
-                        return true;
-                    }
-                }
-                return false;
-            }""")
-            return bool(result)
-        except Exception:
-            return False
+        """只接受可见元素中的明确成功信号；空容器或关闭弹窗不算通过。"""
+        return page.evaluate("""() => {
+            const visible = e => !!e.getClientRects().length &&
+                getComputedStyle(e).visibility !== 'hidden';
+            const labels = ['验证通过', '验证成功', '滑动成功',
+                'Slide completed', 'Verification passed', 'Verification successful'];
+            const nodes = document.querySelectorAll(
+                '[class*="aliyun"], [id*="aliyun"], [class*="captcha"], [id*="captcha"]');
+            return [...nodes].some(e => visible(e) &&
+                labels.some(label => (e.innerText || '').includes(label)));
+        }""")
+
+    def _captcha_visible(self, page):
+        return any(frame.locator(
+            '#aliyunCaptcha-window-float:visible, #aliyunCaptcha-sliding-slider:visible'
+        ).count() for frame in page.frames)
 
     # ── 自动填表 ─────────────────────────────────────────
     def _fill_form(self, page, email, password, name, mode):
@@ -397,12 +327,13 @@ class CaptchaSolver:
             try:
                 btn = page.query_selector(sel)
                 if btn and btn.is_visible():
-                    btn.click()
+                    btn.click(timeout=3000)
                     print(f"  [提交] 已点击按钮: {sel}")
-                    return
+                    return True
             except Exception:
                 continue
         print("  [提交] 未找到提交按钮，请手动点击")
+        return False
 
     # ── 触发验证码 ───────────────────────────────────────
     def _trigger_captcha(self, page):
@@ -419,10 +350,10 @@ class CaptchaSolver:
             try:
                 el = page.query_selector(sel)
                 if el and el.is_visible():
-                    el.click()
+                    el.click(timeout=3000)
                     print(f"  [验证码] 已点击触发区域: {sel}")
-                    time.sleep(2)
-                    return
+                    page.wait_for_timeout(2000)
+                    return True
             except Exception:
                 continue
         print("  [验证码] 未找到触发区域，请手动点击验证")
@@ -445,12 +376,14 @@ class CaptchaSolver:
 
         result = {"response": None}
 
-        with sync_playwright() as p:
+        with sync_playwright() as p, ExitStack() as cleanup:
             browser = p.chromium.launch(
                 headless=False,
+                channel=config.BROWSER_CHANNEL,
                 proxy={"server": self.proxy} if self.proxy else None,
                 args=["--disable-blink-features=AutomationControlled"],
             )
+            cleanup.callback(browser.close)
             ctx = browser.new_context(
                 user_agent=config.UA,
                 viewport={"width": 1280, "height": 800},
@@ -472,8 +405,8 @@ class CaptchaSolver:
             page.on("response", on_response)
 
             print(f"  [浏览器] 打开激活链接...")
-            page.goto(verify_url, wait_until="networkidle", timeout=60000)
-            time.sleep(3)
+            page.goto(verify_url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(3000)
 
             # 填写密码（两个密码框）
             pw_inputs = page.query_selector_all('input[type="password"]')
@@ -486,7 +419,7 @@ class CaptchaSolver:
                 for inp in pw_inputs:
                     inp.fill(password)
 
-            time.sleep(1)
+            page.wait_for_timeout(1000)
 
             # 点击"完成注册"按钮
             clicked = False
@@ -501,7 +434,7 @@ class CaptchaSolver:
                 try:
                     btn = page.query_selector(sel)
                     if btn and btn.is_visible():
-                        btn.click()
+                        btn.click(timeout=3000)
                         print(f"  [提交] 已点击: {sel}")
                         clicked = True
                         break
@@ -522,11 +455,11 @@ class CaptchaSolver:
                         break
                 except Exception:
                     pass
-                time.sleep(0.5)
+                page.wait_for_timeout(500)
 
             if result["response"]:
                 print(f"  [完成] 注册激活成功！")
-                time.sleep(2)
+                page.wait_for_timeout(2000)
             else:
                 print(f"  [超时] {timeout} 秒内未捕获到 finish_signup 响应")
                 # 截图供调试
@@ -535,7 +468,5 @@ class CaptchaSolver:
                     print("  [调试] 截图已保存到 .temp/finish_signup_debug.png")
                 except Exception:
                     pass
-
-            browser.close()
 
         return result["response"]

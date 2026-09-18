@@ -5,6 +5,9 @@
 # 代理地址（留空则不走代理）
 PROXY = "http://127.0.0.1:7897"
 
+# None: Playwright 安装的 Chromium；"chrome" / "msedge": 本机已安装的浏览器。
+BROWSER_CHANNEL = None
+
 # API 基地址（已确认：前端 Mn="" 用相对路径，浏览器 origin 解析为 chat.z.ai）
 API_BASE = "https://chat.z.ai/api/v1"
 
